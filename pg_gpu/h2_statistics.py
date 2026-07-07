@@ -1,16 +1,18 @@
 """
 GPU-accelerated H₂ statistics for h2py inference.
 
-Provides a drop-in replacement for h2py.parsing.compute_h2_statistics(). The
-output format is identical to h2py, which itself mimics moments.LD.
+Provides a drop-in replacement for ``h2py.parsing.compute_h2_statistics()``.
+The output format is identical to h2py, which itself mimics moments.LD.
 """
 
 import cupy as cp
 import numpy as np
 
-from .accessible import resolve_accessible_mask, AccessibleMask
+from .accessible import AccessibleMask, resolve_accessible_mask
 from .genotype_kernels import _PopDataGeno, _GenoPopFlat
+from .genotype_matrix import GenotypeMatrix
 from .haplotype_kernels import _launch, _HapPopFlat
+from .haplotype_matrix import HaplotypeMatrix
 from .ld_pipeline import (
     estimate_ld_chunk_size as _estimate_ld_chunk_size,
     iter_pairs_within_distance as _iter_pairs_within_distance,
@@ -29,24 +31,27 @@ from .moments_ld import (
 
 def compute_h2_statistics(
     vcf_file=None,
+    pop_file=None,
+    pops=None,
+    pop_assignment=None,
     bed_file=None,
     chromosome=None,
+    interval=None,
     rec_map_file=None,
-    pop_file=None,
-    pop_assignment=None,
-    pops=None,
     r_bins=None,
     bp_bins=None,
-    interval=None,
-    use_genotypes=True,
-    stats_to_compute=None,
-    compute_denoms=True,
-    ac_filter=True,
+    min_bp=None,
+    mut_map_file=None,  # TODO
+    u_bar=None,     # TODO
+    use_haplotypes=False,
     report=True,
-    haplotype_matrix=None,
+    compute_denoms=True,
+    stats_to_compute=None,
+    ac_filter=True,
     genotype_matrix=None,
-    ):
-    """GPU-accelerated drop-in replacement for ``h2py.parsing.compute_h2_statistics()``.
+    haplotype_matrix=None,
+):
+    """GPU-accelerated drop-in for ``h2py.parsing.compute_h2_statistics()``.
 
     Accepts same arguments...
 
@@ -89,6 +94,11 @@ def compute_h2_statistics(
             r_bins=[0, 1e-6, 2e-6, 5e-6],
         )
     """
+    # Flip `use_haplotypes`
+    use_genotypes = True
+    if use_haplotypes:
+        use_genotypes = False
+
     if pops is None:
         pops = ['pop0', 'pop1']
     num_pops = len(pops)
@@ -118,7 +128,9 @@ def compute_h2_statistics(
             gm.load_pop_file(pop_file, pops=pops)
             if ac_filter:
                 gm = gm.apply_biallelic_filter()
-            _set_accessible_mask(gm, accessible_bed, interval)
+            if bed_file is not None or interval is not None:
+                mask = _get_mask_with_interval(bed_file, interval, hm.chrom_end)
+                gm.set_accessible_mask(mask)
             gm.transfer_to_gpu()
         mat = gm
         if report:
@@ -141,7 +153,9 @@ def compute_h2_statistics(
             hm.load_pop_file(pop_file, pops=pops)
             if ac_filter:
                 hm = hm.apply_biallelic_filter()
-            _set_accessible_mask(hm, accessible_bed, interval)
+            if bed_file is not None or interval is not None:
+                mask = _get_mask_with_interval(bed_file, interval, hm.chrom_end)
+                hm.set_accessible_mask(mask)
             hm.transfer_to_gpu()
         mat = hm
         if report:
@@ -171,19 +185,16 @@ def compute_h2_statistics(
     h2_stat_names = _h2_names(num_pops)
     het_stat_names = _het_names(num_pops)
 
-    if use_genotypes:
-        h2_sums = _compute_h2_sums(mat, pops, bins, gen_dists_gpi, max_bp_dist,
-                                   use_genotypes=True)
-        het = _compute_heterozygosity(mat, pops, use_genotypes=True)
-    else:
-        h2_sums = _compute_h2_sums(mat, pops, bins, gen_dists_gpu, max_bp_dist)
-        het = _compute_heterozygosity(mat, pops)
+    h2_sums = _compute_h2_sums(mat, pops, bins, gen_dists_gpu, max_bp_dist,
+                               use_genotypes=use_genotypes)
+    het = _compute_heterozygosity(mat, pops, use_genotypes=use_genotypes)
 
     if report:
         print("  Done computing H2 statistics.")
 
     if compute_denoms:
-        all_pos = _get_accessible_bed_positions(bed_file, interval)
+        all_pos = _get_accessible_bed_positions(
+            bed_file, interval, mat.chrom_end)
         pos_gpu = cp.asarray(all_pos)
         n_pos = len(all_pos)
         if r_bins is not None:
@@ -192,9 +203,11 @@ def compute_h2_statistics(
         else:
             coords_gpu = cp.asarray(all_pos)
         if report:
-            print(f"  Computing denominators ({n_pos} pos)")
+            print(f"  Computing denominators ({n_pos} pos) ...")
         bins_gpu = cp.asarray(bins)
         denoms = _compute_h2_denoms(coords_gpu, bins_gpu, max_bp_dist, pos_gpu)
+        if report:
+            print(f"  Done computing denominators.")
     else:
         denoms = None
 
@@ -210,9 +223,9 @@ def compute_h2_statistics(
     return sums
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Internals
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def _compute_h2_sums(
@@ -276,7 +289,7 @@ def _compute_h2_sums(
     else:
         gen_dists_lookup = gen_dists_gpu
 
-    bin_sums = cp.zeros((n_bins, n_ld), dtype=cp.float64)
+    bin_sums = cp.zeros((n_bins, n_h2), dtype=cp.float64)
     stat_specs = _generate_h2_stat_specs(num_pops)
 
     for ci, cj in _iter_pairs_within_distance(pos, max_bp_dist, chunk_size):
@@ -295,11 +308,11 @@ def _compute_h2_sums(
             counts_list.append(c)
             n_valid_list.append(nv)
 
-        if not use_genotypes:
-            stats = compute_multi_pop_h2_batch_geno(
+        if use_genotypes:
+            stats = compute_multi_pop_h2_geno(
                 counts_list, n_valid_list, stat_specs)
         else:
-            stats = compute_multi_pop_h2_batch_hap(
+            stats = compute_multi_pop_h2_hap(
                 counts_list, n_valid_list, stat_specs)
 
         valid = (cb >= 0) & (cb < n_bins)
@@ -308,7 +321,7 @@ def _compute_h2_sums(
         flat_idx = vb[:, None] * n_h2 + cp.arange(n_h2)[None, :]
         cp.add.at(bin_sums.ravel(), flat_idx.ravel(), vs.ravel())
 
-        del_counts_list, n_valid, stats, cb
+        del counts_list, n_valid_list, stats, cb
 
     # Return `bin_sums` to host memory
     return bin_sums.get()
@@ -323,8 +336,7 @@ def _compute_h2_denoms(coords, bins, max_bp_dist, pos):
     """Compute denominators for LD statistics on GPU. These are counts of
     pairs of accessible sites, binned by recombination distance.
     """
-    n_bins = len(bins) - 1
-    denoms = cp.zeros(n_bins, dtype=np.float64)
+    denoms = cp.zeros(len(bins), dtype=np.float64)
     # Inclusive indices of the first right locus to be counted in bin 0, for
     # each left locus in `coords`.
     lower_indices = cp.maximum(cp.searchsorted(coords, coords + bins[0]),
@@ -336,62 +348,46 @@ def _compute_h2_denoms(coords, bins, max_bp_dist, pos):
                                    cp.searchsorted(pos, pos + max_bp_dist))
         denoms[ii] = cp.sum(upper_indices - lower_indices)
         lower_indices = upper_indices
-    return denoms
+    # The last element of `denoms` is the numerator of H
+    denoms[-1] = len(coords)
+    # Return to memory
+    return denoms.get()
 
 
-def _get_accessible_bed_positions(bed_file, interval):
+def _get_accessible_bed_positions(bed_file, interval, chrom_end):
     """Generate an array of accessible positions within a genomic interval."""
-    if interval is not None:
-        chrom_start = 0
-        chrom_end = None
-        accessible_mask = resolve_accessible_mask(
-            bed_file, chrom_start, chrom_end)
-        chrom_end = len(accessible_mask)
-        interval_mask = _get_interval_mask(interval, chrom_start, chrom_end)
-        mask = AccessibleMask(accessible_mask.mask & interval_mask.mask)
-    else:
-        chrom_start = chrom_end = None
-        mask = resolve_accessible_mask(bed_file, chrom_start, chrom_end)
-    # These positions are 1-indexed
-    pos = np.where(mask.mask)[0] + mask.offset
-    return pos
+    mask = _get_mask_with_interval(bed_file, interval, chrom_end)
+    return _get_accessible_positions(mask)
 
 
-def _set_accessible_mask(mat, bed_file, interval):
-    """Mask a matrix using a BED file and genomic interval."""
+def _get_mask_with_interval(bed_file, interval, chrom_end):
+    """Intersect accessible BED intervals with an overriding ``interval``, if
+    both are given.
+
+    If only one of ``bed_file`` or ``interval`` is given, get a mask
+    accounting for it.`
+    """
     if bed_file is not None:
-        accessible_mask = resolve_accessible_mask(
-            bed_file, mat.chrom_start, mat.chrom_end)
+        chrom_start = 1
+        mask = resolve_accessible_mask(bed_file, chrom_start, chrom_end).mask
     else:
-        length = mat.chrom_end - mat.chrom_start
-        accessible_mask = AccessibleMask(np.ones(length), dtype=bool)
+        mask = AccessibleMask(np.ones(chrom_end, dtype=bool))
     if interval is not None:
-        interval_mask = _get_interval_mask(
-            interval, mat.chrom_start, mat.chrom_end)
-    else:
-        interval_mask = AccessibleMask(np.ones(length), dtype=bool)
-    accessible_mask = AccessibleMask(accessible_mask.mask & interval_mask.mask)
-    if np.sum(accessible_mask.mask) < len(accessible_mask):
-        mat.set_accessible_mask(accessible_mask)
-    return
+        mask[:interval[0]] = False
+        mask[interval[1]:] = False
+    accessible_mask = resolve_accessible_mask(mask, None, None)
+    return accessible_mask
 
 
-def _get_interval_mask(interval, chrom_start, chrom_end):
-    """ """
-    mask = np.zeros(chrom_end - chrom_start, dtype=bool)
-    start, end = interval
-    if start < chrom_start:
-        start = chrom_start
-    if end > chrom_end:
-        end = chrom_end
-    mask[start - chrom_start:end - chrom_end] = True
-    return AccessibleMask(mask, offset=chrom_start)
+def _get_accessible_positions(accessible_mask):
+    """Get a 1-indexed array of accessible positions."""
+    return np.where(accessible_mask.mask)[0] + accessible_mask.offset + 1
 
 
 def _generate_h2_stat_specs(num_pops):
     """Generate a list of tuples ('h2', (i, j)), where i, j index pops."""
     specs = []
-    names = _h2_stat_names(num_pops)
+    names = _h2_names(num_pops)
     for name in names:
         parts = name.split("_")
         pop_nums = tuple(int(p) for p in parts[1:])
@@ -399,7 +395,7 @@ def _generate_h2_stat_specs(num_pops):
     return specs
 
 
-def _h2_stat_names(num_pops):
+def _h2_names(num_pops):
     """Generate H₂ statistic names."""
     names = []
     for ii in range(num_pops):
@@ -409,11 +405,11 @@ def _h2_stat_names(num_pops):
 
 
 # -----------------------------------------------------------------------------
-# CUDA kernels for haplotype-based H2 estimators.
+# CUDA kernels for H2.
 # -----------------------------------------------------------------------------
 
 
-_H2_HAP_SINGLE_KERN = cp.RawKernel(r'''
+_H2_WITHIN_HAP_KERN = cp.RawKernel(r'''
 extern "C" __global__
 void k(const double*c1, const double*c2, const double*c3, const double*c4,
        const double*nn, const int*I, double*out, const int M){
@@ -425,8 +421,7 @@ void k(const double*c1, const double*c2, const double*c3, const double*c4,
     out[t]=(den>0.)?num/den:0.;
 }''', "k", options=("-std=c++11",))
 
-
-_H2_HAP_BETWEEN_KERN = cp.RawKernel(r'''
+_H2_BETWEEN_HAP_KERN = cp.RawKernel(r'''
 extern "C" __global__
 void k(const double*c1, const double*c2, const double*c3, const double*c4,
        const double*nn, const int*I, const int*J, double*out, const int M){
@@ -439,108 +434,20 @@ void k(const double*c1, const double*c2, const double*c3, const double*c4,
     out[t]=(den>0.)?num/den:0.;
 }''', "k", options=("-std=c++11",))
 
-
-_H2_GENO_WITHIN_KERN = cp.RawKernel(r'''
-extern "C" __global__
-void k(const float*g1,const float*g2,const float*g3,const float*g4,
-       const float*g5,const float*g6,const float*g7,const float*g8,
-       const float*g9,const double*nn,const int* I,double*out,const int M){
-    int t=blockDim.x*blockIdx.x+threadIdx.x;
-    if(t>=M)return;
-    int i=I[t];
-    double n1=g1[i],n2=g2[i],n3=g3[i],n4=g4[i],n5=g5[i],
-           n6=g6[i],n7=g7[i],n8=g8[i],n9=g9[i],n=nn[i];
-    if(n<1.0){out[t]=0.;return;}
-    double num=(
-        n1*n5
-        +2.0*n1*n6
-        +2.0*n1*n8
-        +4.0*n1*n9
-        +n2*n4
-        +n2*n5
-        +n2*n6
-        +2.0*n2*n7
-        +2.0*n2*n8
-        +2.0*n2*n9
-        +2.0*n3*n4
-        +n3*n5
-        +4.0*n3*n7
-        +2.0*n3*n8
-        +n4*n5
-        +2.0*n4*n6
-        +n4*n8
-        +2.0*n4*n9
-        +0.5*n5*(n5+1)
-        +n5*n6
-        +n5*n7
-        +n5*n8
-        +n5*n9
-        +2.0*n6*n7
-        +n6*n8);
-    double den=n*(2.0*n-1.0);
-    out[t]=num/den;
-}''', "k", options=("-std=c++11",))
-
-
-_H2_GENO_WITHIN_KERN = cp.RawKernel(r'''
+_H2_WITHIN_GENO_KERN = cp.RawKernel(r'''
 extern "C" __global__
 void k(const double*g,const double*nn,const int* I,double*out,const int M){
     int t=blockDim.x*blockIdx.x+threadIdx.x;
     if(t>=M)return;
     int i=I[t];
     const double*row=g+9*i;
-    double n1=row[0],n2=row[1],n3=row[2],n4=row[3],n5=row[4],
-           n6=row[5],n7=row[6],n8=row[7],n9=row[8];
+    double n5=row[4],n=nn[i];
     if(n<1.0){out[t]=0.;return;}
-    double num=(
-        n1*n5
-        +2.0*n1*n6
-        +2.0*n1*n8
-        +4.0*n1*n9
-        +n2*n4
-        +n2*n5
-        +n2*n6
-        +2.0*n2*n7
-        +2.0*n2*n8
-        +2.0*n2*n9
-        +2.0*n3*n4
-        +n3*n5
-        +4.0*n3*n7
-        +2.0*n3*n8
-        +n4*n5
-        +2.0*n4*n6
-        +n4*n8
-        +2.0*n4*n9
-        +0.5*n5*(n5+1)
-        +n5*n6
-        +n5*n7
-        +n5*n8
-        +n5*n9
-        +2.0*n6*n7
-        +n6*n8);
-    double den=n*(2.0*n-1.0);
-    out[t]=num/den;
-}''', "k", options=("-std=c++11",))
+    // This estimator is merely the frequency of double heterozygotes
+    out[t]=n5/n;
+}''', "k", options=("-std=c++11",)) 
 
-
-# Factored for efficiency
-__H2_GENO_BETWEEN_KERN = cp.RawKernel(r'''
-extern "C" __global__
-void k(const double*X11,const double*X10,const double*X01,const double*X00,
-       const double*nn,const int*I,const int*J,double*out,const int N){
-    int t=blockDim.x*blockIdx.x+threadIdx.x;
-    if(t>=N)return;
-    int i=I[t],j=J[t];
-    double ni=nn[i],nj=nn[j];
-    double X11i=X11[i],X10i=X10[i],X01i=X01[i],X00i=X00[i];
-    double X11j=X11[j],X10j=X10[j],X01j=X01[j],X00j=X00[j];
-    double num=X11i*X00j+X11j*X00i+X10i*X01j+X10j*X01i;
-    double den=ni*nj;
-    out[t]=(den>0.0)?num/den:0.0;
-}''', "k", options=("-std=c++11",))
-
-# Factored for efficiency
-_H2_GENO_BETWEEN_KERN = cp.RawKernel(r'''
+_H2_BETWEEN_GENO_KERN = cp.RawKernel(r'''
 extern "C" __global__
 void k(const double*X11,const double*X10,const double*X01,
        const double*nn,const int*I,const int*J,double*out,const int N){
@@ -563,18 +470,9 @@ void k(const double*X11,const double*X10,const double*X01,
 # -----------------------------------------------------------------------------
 
 
-def compute_multi_pop_h2_batch_hap(
-    counts_per_pop,
-    n_valid_per_pop,
-    stat_specs,
-    ):
-    """Compute all H₂ statistics using haplotype counts.
-    """
-    def expand(pop_arr):
-        """Expand pop indices to flat pair indices: pop*N + pair."""
-        return (pop_arr[:, None] * N + pair_range[None, :]).ravel()
-
-    n_pairs = counts_list[0].shape[0]
+def compute_multi_pop_h2_hap(counts_per_pop, n_valid_per_pop, stat_specs):
+    """Compute all specified H₂ statistics using haplotype counts."""
+    n_pairs = counts_per_pop[0].shape[0]
     n_stats = len(stat_specs)
     pops = [_PopData(counts_per_pop[p], n_valid_per_pop[p])
             for p in range(len(counts_per_pop))]
@@ -585,87 +483,20 @@ def compute_multi_pop_h2_batch_hap(
     between_calls = [(idx, c) for idx, c in enumerate(h2_calls) if c[0] != c[1]]
 
     pair_range = cp.arange(n_pairs, dtype=cp.int32)
+
+    def expand(pop_arr):
+        return (pop_arr[:, None] * n_pairs + pair_range[None, :]).ravel()
+
     result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
 
     if within_calls:
-        # Index to `flat_pops` arrays
         idxs = [i for i, _ in within_calls]
         calls = [c for _, c in within_calls]
-        fI = expand(cp.array([calls[0]], dtype=cp.int32))
-        M = len(calls) * n_pairs
-        out = cp.empty(M, dtype=cp.float64)
-        args = (F.c1, F.c2, F.c3, F.c4, F.n, fI, out, M)
-        _launch(_H2_HAP_WITHIN_KERN, args, M)
-        for fi, res_idx in enumerate(idxs):
-            result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
-
-    if between_calls:
-        idxs = [i for i, _ in between_calls]
-        calls = [c for _, c in between_calls]
-        fI = expand(cp.array([calls[0]], dtype=cp.int32))
-        fJ = expand(cp.array([calls[1]], dtype=cp.int32))
-        M = len(calls) * n_pairs
-        out = cp.empty(M, dtype=cp.float64)
-        args = (F.c1, F.c2, F.c3, F.c4, F.n, fI, fJ, out, M)
-        _launch(_H2_HAP_BETWEEN_KERN, args, M)
-        for fi, res_idx in enumerate(idxs):
-            result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
-    return result
-
-
-def compute_multi_pop_h2_batch_geno(
-    counts_per_pop,
-    n_valid_per_pop,
-    stat_specs
-    ):
-    """Compute all H₂ statistics using genotype counts.
-    """
-    def expand(pop_arr):
-        """Expand pop indices to flat pair indices: pop*N + pair."""
-        return (pop_arr[:, None] * N + pair_range[None, :]).ravel()
-
-    n_pairs = counts_per_pop[0].shape[0]
-    n_stats = len(stat_specs)
-    pops = [_PopDataGeno(counts_per_pop[p], n_valid_per_pop[p])
-            for p in range(len(counts_per_pop))]
-    n_pops = len(pops)
-    h2_calls = [pidx for stat, pidx in stat_specs if stat == "h2"]
-    within_calls = [(idx, c) for idx, c in enumerate(h2_calls) if c[0] == c[1]]
-    between_calls = [(idx, c) for idx, c in enumerate(h2_calls) if c[0] != c[1]]
-
-    # Flatten population-specific arrays into a flat contiguous (P*N,) arrs.
-    # Is this a silly way to handle two-locus genotype counts?
-    #g1_f = cp.ascontiguousarray(cp.concatenate([p.g1 for p in pops]))
-    #g2_f = cp.ascontiguousarray(cp.concatenate([p.g2 for p in pops]))
-    #g3_f = cp.ascontiguousarray(cp.concatenate([p.g3 for p in pops]))
-    #g4_f = cp.ascontiguousarray(cp.concatenate([p.g4 for p in pops]))
-    #g5_f = cp.ascontiguousarray(cp.concatenate([p.g5 for p in pops]))
-    #g6_f = cp.ascontiguousarray(cp.concatenate([p.g6 for p in pops]))
-    #g7_f = cp.ascontiguousarray(cp.concatenate([p.g7 for p in pops]))
-    #g8_f = cp.ascontiguousarray(cp.concatenate([p.g8 for p in pops]))
-    #g9_f = cp.ascontiguousarray(cp.concatenate([p.g9 for p in pops]))
-    # Invert allele labels for precomputed features. These are used to
-    # compute the between-population statistic.
-    #nn_f = cp.ascontiguousarray(cp.concatenate([p.n for p in pops]))
-    #X10_f = cp.ascontiguousarray(cp.concatenate([p.X01 for p in pops]))
-    #X01_f = cp.ascontiguousarray(cp.concatenate([p.X10 for p in pops]))
-    #X00_f = cp.ascontiguousarray(cp.concatenate([p.X11 for p in pops]))
-    #X11_f = nn_f - X01_f - X10_f - X00_f
-
-    F = _GenoPopFlat(pops)
-
-    result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
-
-    if within_calls:
-        idxs = [i for i, _ in within_calls]
-        calls = [c for _, c in between_calls]
         fI = expand(cp.array([c[0] for c in calls], dtype=cp.int32))
         M = len(calls) * n_pairs
         out = cp.empty(M, dtype=cp.float64)
-        #args = (g1_f, g2_f, g3_f, g4_f, g5_f, g6_f,
-        #        g7_f, g8_f, g9_f, nn_f, fI, out, M)
-        args = (F.g_moments, args.n, fI, out, M)
-        _launch(_H2_GENO_WITHIN_KERN, args, M)
+        args = (F.c1, F.c2, F.c3, F.c4, F.n, fI, out, M)
+        _launch(_H2_WITHIN_HAP_KERN, args, M)
         for fi, res_idx in enumerate(idxs):
             result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
 
@@ -676,10 +507,55 @@ def compute_multi_pop_h2_batch_geno(
         fJ = expand(cp.array([c[1] for c in calls], dtype=cp.int32))
         M = len(calls) * n_pairs
         out = cp.empty(M, dtype=cp.float64)
-        #args = (X11_f, X10_f, X01_f, X00_f, nn_f, fI, fJ, out, M)
-        args = (F.X11, F.X10, F.X01, F.n, fI, fJ, out, M)
-        _launch(_H2_GENO_BETWEEN_KERN, args, M)
+        args = (F.c1, F.c2, F.c3, F.c4, F.n, fI, fJ, out, M)
+        _launch(_H2_BETWEEN_HAP_KERN, args, M)
         for fi, res_idx in enumerate(idxs):
             result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
+
+    return result
+
+
+def compute_multi_pop_h2_geno(counts_per_pop, n_valid_per_pop, stat_specs):
+    """Compute all specified H₂ statistics using genotype counts."""
+    n_pairs = counts_per_pop[0].shape[0]
+    n_stats = len(stat_specs)
+    pops = [_PopDataGeno(counts_per_pop[p], n_valid_per_pop[p])
+            for p in range(len(counts_per_pop))]
+    F = _GenoPopFlat(pops)
+    h2_calls = [pidx for stat, pidx in stat_specs if stat == "h2"]
+    within_calls = [(idx, c) for idx, c in enumerate(h2_calls) if c[0] == c[1]]
+    between_calls = [(idx, c) for idx, c in enumerate(h2_calls) if c[0] != c[1]]
+
+    pair_range = cp.arange(n_pairs, dtype=cp.int32)
+
+    def expand(pop_arr):
+        return (pop_arr[:, None] * n_pairs + pair_range[None, :]).ravel()
+
+    result = cp.zeros((n_pairs, n_stats), dtype=cp.float64)
+
+    if within_calls:
+        idxs = [i for i, _ in within_calls]
+        calls = [c for _, c in between_calls]
+        fI = expand(cp.array([c[0] for c in calls], dtype=cp.int32))
+        M = len(calls) * n_pairs
+        out = cp.empty(M, dtype=cp.float64)
+        args = (F.g_moments, F.n, fI, out, M)
+        _launch(_H2_WITHIN_GENO_KERN, args, M)
+        for fi, res_idx in enumerate(idxs):
+            result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
+
+    # Between-population H2 exploits quantities precomputed for pi2_ijij
+    if between_calls:
+        idxs = [i for i, _ in between_calls]
+        calls = [c for _, c in between_calls]
+        fI = expand(cp.array([c[0] for c in calls], dtype=cp.int32))
+        fJ = expand(cp.array([c[1] for c in calls], dtype=cp.int32))
+        M = len(calls) * n_pairs
+        out = cp.empty(M, dtype=cp.float64)
+        args = (F.X11, F.X10, F.X01, F.n, fI, fJ, out, M)
+        _launch(_H2_BETWEEN_GENO_KERN, args, M)
+        for fi, res_idx in enumerate(idxs):
+            result[:, res_idx] = out[fi * n_pairs:(fi + 1) * n_pairs]
+
     return result
 
